@@ -1,0 +1,109 @@
+name: collect-6686
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/collect.yml"
+  workflow_dispatch:
+    inputs:
+      iid:
+        description: "Optional 6686 match iid for full market snapshot"
+        required: false
+        type: string
+  schedule:
+    - cron: "17 * * * *"
+permissions:
+  contents: write
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Fetch 6686
+        env:
+          IID: ${{ inputs.iid }}
+          ORIGIN: https://6686plkqjrsn226.app
+          API_BASE: https://ubs-nwapi.wwqvast.com
+        shell: bash
+        run: |
+          python - <<'PY'
+          import base64, json, os, re, time, uuid
+          from datetime import datetime, timezone
+          from pathlib import Path
+          from urllib.parse import urlparse
+          from urllib.request import Request, urlopen
+
+          origin=os.environ['ORIGIN'].rstrip('/')
+          api=os.environ['API_BASE'].rstrip('/')
+          iid=(os.environ.get('IID') or '').strip()
+          out=Path('data'); out.mkdir(exist_ok=True)
+
+          def text(url, headers=None, timeout=25):
+              req=Request(url,headers=headers or {'User-Agent':'Mozilla/5.0'})
+              with urlopen(req,timeout=timeout) as r:
+                  return r.read().decode('utf-8','replace')
+
+          def js(url, headers=None):
+              return json.loads(text(url,headers))
+
+          client=text(origin+'/client.js?n='+str(int(time.time()*1000)),{
+              'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36',
+              'Accept':'*/*','Referer':origin+'/'})
+          m=re.search(r'window\._env_\["x-checksum"\]\s*=\s*"([0-9a-fA-F]+)"',client)
+          if not m: raise SystemExit('x-checksum seed not found in client.js')
+          seed=m.group(1)
+          xuuid=uuid.uuid4().hex
+
+          def hdr():
+              host=urlparse(origin).hostname
+              ts=str(int(time.time()*1000))
+              raw=f'{seed}|{host}|{xuuid}|{ts}|'
+              return {
+                  'currency':'CNY','browser':'Chrome','devicemode':'Windows','apptype':'2',
+                  'accept-language':'zh-cn','time-zone':'GMT+08:00','screen':'1433x103',
+                  'accept':'application/json, text/plain, */*','phonebrand':'Microsoft',
+                  'user-agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36',
+                  'os':'unknown 10','x-checksum':base64.b64encode(raw.encode()).decode(),
+                  'x-uuid':xuuid,'device':'mobile','origin':origin,'referer':origin+'/'
+              }
+
+          list_url=api+'/product/business/sport/prematch/tournament?sid=1&date=period%3A7d&sort=tournament&inplay=false'
+          payload=js(list_url,hdr())
+          tournaments=(payload.get('data') or {}).get('tournaments') or []
+          matches=[]
+          for t in tournaments:
+              for x in t.get('matches') or []:
+                  matches.append({
+                      'iid':int(x['iid']), 'tournament':x.get('tnName') or t.get('name') or t.get('tnName'),
+                      'home':(x.get('home') or {}).get('name'), 'away':(x.get('away') or {}).get('name'),
+                      'kickoff':x.get('kickoffTime') or x.get('kickoff'), 'inplay':bool(x.get('inplay'))
+                  })
+          now=datetime.now(timezone.utc).isoformat()
+          (out/'matches.json').write_text(json.dumps({'generated_at':now,'count':len(matches),'matches':matches},ensure_ascii=False,indent=2),encoding='utf-8')
+          diag={'ok':True,'generated_at':now,'origin':origin,'api_base':api,'matches':len(matches),'tournaments':len(tournaments),'iid_requested':iid or None}
+
+          if iid:
+              match_url=api+f'/product/business/sport/prematch/match?sid=1&iid={int(iid)}&language=zh-cn'
+              mp=js(match_url,hdr())
+              d=mp.get('data') or {}
+              if isinstance(d,dict) and isinstance(d.get('data'),dict): d=d['data']
+              market=d.get('market') or {}
+              core={k:market[k] for k in ('1x2','ah','ou','dc','dnb','btts','1x2_1st','ah_1st','ou_1st') if k in market}
+              snap={'generated_at':now,'iid':int(iid),'name':d.get('name'),'market_count':len(market),'core_markets':core,'all_markets':market}
+              (out/'latest.json').write_text(json.dumps(snap,ensure_ascii=False,indent=2),encoding='utf-8')
+              diag['market_count']=len(market); diag['match_name']=d.get('name')
+
+          (out/'connectivity.json').write_text(json.dumps(diag,ensure_ascii=False,indent=2),encoding='utf-8')
+          print(json.dumps(diag,ensure_ascii=False))
+          PY
+      - name: Commit data
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/
+          git diff --cached --quiet || git commit -m "Update 6686 data"
+          git push
